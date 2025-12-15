@@ -5,11 +5,13 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use http_body_util::BodyExt;
+use hyper_rustls::HttpsConnectorBuilder;
 use hyper_util::{
-    client::legacy::{connect::HttpConnector, Client},
+    client::legacy::Client,
     rt::TokioExecutor,
 };
 use sqlx::PgPool;
+use std::error::Error;
 use std::sync::Arc;
 
 use crate::{
@@ -23,8 +25,9 @@ pub struct ProxyState {
     pub backends: Vec<Backend>,
     pub load_balancer: Arc<dyn LoadBalancer>,
     pub health_checker: Arc<HealthChecker>,
-    pub client: Client<HttpConnector, Body>,
+    pub client: Client<hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>, Body>,
     pub db_pool: PgPool,
+    pub vk_secret: Option<String>,
 }
 
 impl ProxyState {
@@ -33,8 +36,17 @@ impl ProxyState {
         load_balancer: Arc<dyn LoadBalancer>,
         health_checker: Arc<HealthChecker>,
         db_pool: PgPool,
+        vk_secret: Option<String>,
     ) -> Self {
-        let client = Client::builder(TokioExecutor::new()).build_http();
+        // Create HTTPS connector with native TLS roots
+        let https = HttpsConnectorBuilder::new()
+            .with_native_roots()
+            .expect("Failed to load native root certificates")
+            .https_or_http()
+            .enable_http1()
+            .build();
+
+        let client = Client::builder(TokioExecutor::new()).build(https);
 
         Self {
             backends,
@@ -42,6 +54,7 @@ impl ProxyState {
             health_checker,
             client,
             db_pool,
+            vk_secret,
         }
     }
 }
@@ -67,17 +80,21 @@ async fn select_backend_via_load_balancer(state: &ProxyState) -> Result<Backend,
 /// Extract file ID from common URL patterns
 /// Supports patterns like:
 /// - /api/v1/files/{id}
+/// - /api/v1/files/{id}/content
+/// - /api/v1/files/{id}/download
 /// - /api/v1/files/download/{id}
 /// - /files/{id}
 /// - /download/{id}
 fn extract_file_id_from_path(path: &str) -> Option<String> {
     let segments: Vec<&str> = path.trim_start_matches('/').split('/').collect();
 
-    // Pattern: /api/v1/files/{id} or /api/v1/files/download/{id}
+    // Pattern: /api/v1/files/{id}[/...] or /api/v1/files/download/{id}
     if segments.len() >= 4 && segments[0] == "api" && segments[2] == "files" {
         if segments.len() >= 5 && segments[3] == "download" {
+            // Pattern: /api/v1/files/download/{id}
             return Some(segments[4].to_string());
-        } else if segments.len() == 4 {
+        } else if segments.len() >= 4 {
+            // Pattern: /api/v1/files/{id}[/content|/download|etc]
             return Some(segments[3].to_string());
         }
     }
@@ -171,6 +188,14 @@ pub async fn proxy_handler(
         }
     };
 
+    tracing::debug!(
+        "Proxying to: {} (scheme: {:?}, host: {:?}, port: {:?})",
+        backend_url,
+        uri.scheme_str(),
+        uri.host(),
+        uri.port_u16()
+    );
+
     // Actualiza la URI de la petición
     *req.uri_mut() = uri.clone();
 
@@ -187,15 +212,25 @@ pub async fn proxy_handler(
         }
     }
 
+    // Agrega el header X-KV-SECRET si está configurado
+    if let Some(ref secret) = state.vk_secret {
+        if let Ok(header_value) = HeaderValue::from_str(secret) {
+            req.headers_mut().insert("X-KV-SECRET", header_value);
+        }
+    }
+
     // Reenvía la petición al backend
     let response = match state.client.request(req).await {
         Ok(res) => res,
         Err(e) => {
-            tracing::error!("Failed to proxy request to backend {}: {}", backend.server_id, e);
+            tracing::error!("Failed to proxy request to backend {}: {} (source: {:?})", backend.server_id, e, e.source());
             state.load_balancer.release_backend(&backend).await;
             return Err(StatusCode::BAD_GATEWAY);
         }
     };
+
+    let status = response.status();
+    tracing::debug!("Backend {} responded with status: {}", backend.server_id, status);
 
     // Libera el backend en el load balancer
     state.load_balancer.release_backend(&backend).await;
@@ -270,6 +305,13 @@ pub async fn proxy_to_specific_backend(
         }
     }
 
+    // Agrega el header X-KV-SECRET si está configurado
+    if let Some(ref secret) = state.vk_secret {
+        if let Ok(header_value) = HeaderValue::from_str(secret) {
+            req.headers_mut().insert("X-KV-SECRET", header_value);
+        }
+    }
+
     // Reenvía la petición al backend
     let response = match state.client.request(req).await {
         Ok(res) => res,
@@ -313,4 +355,143 @@ pub async fn gateway_stats(State(state): State<ProxyState>) -> impl IntoResponse
     });
 
     (StatusCode::OK, axum::Json(stats))
+}
+
+/// Handler para eliminar archivos caducados
+/// Este endpoint busca todos los archivos con delete_at <= NOW() y los elimina
+/// enviando una petición DELETE al backend correspondiente
+pub async fn delete_expired_files(State(state): State<ProxyState>) -> impl IntoResponse {
+    tracing::info!("Starting expired files cleanup");
+
+    // Obtener archivos caducados
+    let expired_files = match crate::db::get_expired_files(&state.db_pool).await {
+        Ok(files) => files,
+        Err(e) => {
+            tracing::error!("Failed to get expired files: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(serde_json::json!({
+                    "error": "Failed to get expired files",
+                    "message": e.to_string()
+                }))
+            );
+        }
+    };
+
+    if expired_files.is_empty() {
+        tracing::info!("No expired files found");
+        return (
+            StatusCode::OK,
+            axum::Json(serde_json::json!({
+                "deleted": 0,
+                "failed": 0,
+                "message": "No expired files found"
+            }))
+        );
+    }
+
+    tracing::info!("Found {} expired files to delete", expired_files.len());
+
+    let mut deleted_count = 0;
+    let mut failed_count = 0;
+
+    for expired_file in expired_files {
+        tracing::info!("Deleting expired file {} from backend {}",
+            expired_file.file_id, expired_file.server_id);
+
+        // Encontrar el backend
+        let backend = match state.backends.iter().find(|b| b.server_id == expired_file.server_id) {
+            Some(b) => b,
+            None => {
+                tracing::error!("Backend {} not found for file {}",
+                    expired_file.server_id, expired_file.file_id);
+                failed_count += 1;
+                continue;
+            }
+        };
+
+        // Construir URL de eliminación
+        let delete_url = format!(
+            "{}/api/v1/files/{}",
+            backend.server_url.trim_end_matches('/'),
+            expired_file.file_id
+        );
+
+        // Parsear URI
+        let uri = match delete_url.parse::<Uri>() {
+            Ok(uri) => uri,
+            Err(e) => {
+                tracing::error!("Failed to parse delete URL {}: {}", delete_url, e);
+                failed_count += 1;
+                continue;
+            }
+        };
+
+        // Construir petición DELETE
+        let mut req_builder = axum::http::Request::builder()
+            .method("DELETE")
+            .uri(uri.clone());
+
+        // Agregar header Host
+        if let Some(host) = uri.host() {
+            req_builder = req_builder.header("host", host);
+        }
+
+        // Agregar header X-KV-SECRET si está configurado
+        if let Some(ref secret) = state.vk_secret {
+            req_builder = req_builder.header("X-KV-SECRET", secret);
+        }
+
+        let request = match req_builder.body(axum::body::Body::empty()) {
+            Ok(req) => req,
+            Err(e) => {
+                tracing::error!("Failed to build delete request: {}", e);
+                failed_count += 1;
+                continue;
+            }
+        };
+
+        // Enviar petición
+        match state.client.request(request).await {
+            Ok(response) if response.status().is_success() => {
+                tracing::info!("Successfully deleted file {} from backend {}",
+                    expired_file.file_id, expired_file.server_id);
+
+                // Eliminar de la base de datos
+                match crate::db::delete_file_metadata(&state.db_pool, &expired_file.file_id).await {
+                    Ok(_) => {
+                        tracing::info!("Deleted metadata for file {}", expired_file.file_id);
+                        deleted_count += 1;
+                    },
+                    Err(e) => {
+                        tracing::error!("Failed to delete metadata for file {}: {}",
+                            expired_file.file_id, e);
+                        failed_count += 1;
+                    }
+                }
+            },
+            Ok(response) => {
+                tracing::error!("Backend returned error {} for file {}",
+                    response.status(), expired_file.file_id);
+                failed_count += 1;
+            },
+            Err(e) => {
+                tracing::error!("Failed to delete file {} from backend: {}",
+                    expired_file.file_id, e);
+                failed_count += 1;
+            }
+        }
+    }
+
+    tracing::info!("Expired files cleanup completed: {} deleted, {} failed",
+        deleted_count, failed_count);
+
+    (
+        StatusCode::OK,
+        axum::Json(serde_json::json!({
+            "deleted": deleted_count,
+            "failed": failed_count,
+            "message": format!("Cleanup completed: {} deleted, {} failed", deleted_count, failed_count)
+        }))
+    )
 }

@@ -6,22 +6,19 @@ mod load_balancer;
 mod proxy;
 
 use anyhow::Result;
-use axum::{
-    routing::get,
-    Router,
-};
+use axum::{routing::get, Router};
 use std::sync::Arc;
-use tower_http::{
-    cors::CorsLayer,
-    trace::TraceLayer,
-};
+use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::{
     config::Config,
     health::HealthChecker,
     load_balancer::create_load_balancer,
-    proxy::{gateway_health, gateway_stats, proxy_handler, proxy_to_specific_backend, ProxyState},
+    proxy::{
+        delete_expired_files, gateway_health, gateway_stats, proxy_handler,
+        proxy_to_specific_backend, ProxyState,
+    },
 };
 
 #[tokio::main]
@@ -54,7 +51,9 @@ async fn main() -> Result<()> {
     tracing::info!("Loaded {} backends from database", backends.len());
 
     if backends.is_empty() {
-        tracing::warn!("No backends found in database. The gateway will not be able to proxy requests.");
+        tracing::warn!(
+            "No backends found in database. The gateway will not be able to proxy requests."
+        );
     }
 
     for backend in &backends {
@@ -69,8 +68,8 @@ async fn main() -> Result<()> {
 
     // Crea el load balancer
     // Puedes cambiar la estrategia aquí: "round-robin", "least-connections", "random", "weighted-round-robin"
-    let load_balancer_strategy = std::env::var("LOAD_BALANCER_STRATEGY")
-        .unwrap_or_else(|_| "round-robin".to_string());
+    let load_balancer_strategy =
+        std::env::var("LOAD_BALANCER_STRATEGY").unwrap_or_else(|_| "round-robin".to_string());
 
     let load_balancer = create_load_balancer(&load_balancer_strategy);
     tracing::info!("Using load balancer: {}", load_balancer.name());
@@ -88,22 +87,38 @@ async fn main() -> Result<()> {
         .clone()
         .start_health_checks(backends.clone(), health_check_interval)
         .await;
-    tracing::info!("Health checker started (interval: {}s)", health_check_interval);
+    tracing::info!(
+        "Health checker started (interval: {}s)",
+        health_check_interval
+    );
 
     // Crea el estado del proxy
-    let proxy_state = ProxyState::new(backends, load_balancer, health_checker, db_pool.clone());
+    let proxy_state = ProxyState::new(
+        backends,
+        load_balancer,
+        health_checker,
+        db_pool.clone(),
+        config.vk_secret.clone(),
+    );
 
     // Configura las rutas de Axum
     let app = Router::new()
         // Rutas del gateway
         .route("/health", get(gateway_health))
         .route("/stats", get(gateway_stats))
+        .route(
+            "/api/v1/files/delete-expired",
+            axum::routing::delete(delete_expired_files),
+        )
         // Ruta para acceder a un backend específico por ID
-        .route("/backend/:server_id/*path", get(proxy_to_specific_backend)
-            .post(proxy_to_specific_backend)
-            .put(proxy_to_specific_backend)
-            .patch(proxy_to_specific_backend)
-            .delete(proxy_to_specific_backend))
+        .route(
+            "/backend/:server_id/*path",
+            get(proxy_to_specific_backend)
+                .post(proxy_to_specific_backend)
+                .put(proxy_to_specific_backend)
+                .patch(proxy_to_specific_backend)
+                .delete(proxy_to_specific_backend),
+        )
         // Ruta catch-all para proxy transparente
         .fallback(proxy_handler)
         .with_state(proxy_state)
@@ -117,10 +132,11 @@ async fn main() -> Result<()> {
 
     tracing::info!("VK Gateway listening on {}", addr);
     tracing::info!("Gateway endpoints:");
-    tracing::info!("  - GET  /health       - Gateway health check");
-    tracing::info!("  - GET  /stats        - Gateway statistics");
-    tracing::info!("  - *    /backend/:id/* - Proxy to specific backend");
-    tracing::info!("  - *    /*            - Proxy to load-balanced backend");
+    tracing::info!("  - GET  /health                        - Gateway health check");
+    tracing::info!("  - GET  /stats                         - Gateway statistics");
+    tracing::info!("  - POST /api/v1/files/delete-expired   - Delete expired files");
+    tracing::info!("  - *    /backend/:id/*                 - Proxy to specific backend");
+    tracing::info!("  - *    /*                             - Proxy to load-balanced backend");
 
     axum::serve(listener, app).await?;
 

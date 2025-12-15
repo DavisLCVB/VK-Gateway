@@ -40,11 +40,37 @@ pub async fn get_backend_by_id(pool: &PgPool, server_id: &str) -> Result<Option<
 /// Returns the backend server_id that owns this file
 pub async fn get_file_backend(pool: &PgPool, file_id: &str) -> Result<Option<String>, sqlx::Error> {
     let result = sqlx::query_scalar::<_, String>(
-        "SELECT server_id FROM metadata WHERE id = $1"
+        "SELECT server_id FROM application.metadata WHERE file_id = $1"
     )
     .bind(file_id)
     .fetch_optional(pool)
     .await?;
 
     Ok(result)
+}
+
+#[derive(Debug, sqlx::FromRow)]
+pub struct ExpiredFile {
+    pub file_id: String,
+    pub server_id: String,
+}
+
+/// Get all files that have expired (delete_at <= NOW())
+pub async fn get_expired_files(pool: &PgPool) -> Result<Vec<ExpiredFile>, sqlx::Error> {
+    sqlx::query_as::<_, ExpiredFile>(
+        "SELECT file_id, server_id FROM application.metadata
+         WHERE delete_at IS NOT NULL AND delete_at <= NOW()"
+    )
+    .fetch_all(pool)
+    .await
+}
+
+/// Delete a file from metadata table
+pub async fn delete_file_metadata(pool: &PgPool, file_id: &str) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM application.metadata WHERE file_id = $1")
+        .bind(file_id)
+        .execute(pool)
+        .await?;
+
+    Ok(())
 }
