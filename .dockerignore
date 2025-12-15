@@ -1,0 +1,52 @@
+# Rust build artifacts
+target/
+Cargo.lock
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Git
+.git/
+.gitignore
+
+# Environment files
+.env*
+
+# Logs
+*.log
+
+# Documentation
+*.md
+!README.md
+
+# CI/CD (except cloudbuild.yaml)
+.github/
+.gitlab-ci.yml
+
+# Test files
+tests/
+*.test
+
+# Database files
+*.sql
+*.db
+*.sqlite
+
+# Scripts
+*.sh
+
+# API documentation
+API*
+
+# Docker files (to avoid recursive copying)
+Dockerfile*
+.dockerignore
+docker-compose*.yml
