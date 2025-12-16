@@ -4,9 +4,10 @@ mod db;
 mod health;
 mod load_balancer;
 mod proxy;
+mod rate_limiter;
 
 use anyhow::Result;
-use axum::{routing::get, Router};
+use axum::{middleware, routing::get, Router};
 use std::sync::Arc;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -19,6 +20,7 @@ use crate::{
         delete_expired_files, gateway_health, gateway_stats, proxy_handler,
         proxy_to_specific_backend, ProxyState,
     },
+    rate_limiter::{rate_limit_middleware, RateLimiterConfig},
 };
 
 #[tokio::main]
@@ -43,8 +45,30 @@ async fn main() -> Result<()> {
     tracing::info!("Connected to PostgreSQL");
 
     // Conecta a Redis
-    let _redis_client = cache::create_redis_client(&config.redis_url).await?;
+    let redis_client = cache::create_redis_client(&config.redis_url).await?;
     tracing::info!("Connected to Redis");
+
+    // Configura rate limiter
+    let rate_limiter_config = RateLimiterConfig {
+        max_requests: std::env::var("RATE_LIMIT_MAX_REQUESTS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(10),
+        window_secs: std::env::var("RATE_LIMIT_WINDOW_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(60),
+        block_duration_secs: std::env::var("RATE_LIMIT_BLOCK_DURATION_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(300),
+    };
+    tracing::info!(
+        "Rate limiter configured: max {} requests per {} seconds, block for {} seconds",
+        rate_limiter_config.max_requests,
+        rate_limiter_config.window_secs,
+        rate_limiter_config.block_duration_secs
+    );
 
     // Obtiene la lista de backends desde la base de datos
     let backends = db::get_all_backends(&db_pool).await?;
@@ -129,8 +153,10 @@ async fn main() -> Result<()> {
                 axum::http::header::AUTHORIZATION,
                 axum::http::header::CONTENT_TYPE,
                 axum::http::header::ACCEPT,
-                // Custom header X-VK-Secret
+                axum::http::header::ORIGIN,
+                // Custom headers
                 axum::http::header::HeaderName::from_static("x-vk-secret"),
+                axum::http::header::HeaderName::from_static("x-upload-token"),
             ])
             .allow_credentials(true)
     } else {
@@ -160,6 +186,9 @@ async fn main() -> Result<()> {
         .fallback(proxy_handler)
         .with_state(proxy_state)
         // Middlewares
+        .layer(middleware::from_fn(move |req, next| {
+            rate_limit_middleware(redis_client.clone(), rate_limiter_config.clone(), req, next)
+        }))
         .layer(cors_layer)
         .layer(TraceLayer::new_for_http());
 
