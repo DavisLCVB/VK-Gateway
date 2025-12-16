@@ -101,6 +101,34 @@ async fn main() -> Result<()> {
         config.vk_secret.clone(),
     );
 
+    // Configura CORS basado en variables de entorno
+    let cors_layer = if let Some(allowed_origins) = &config.cors_allowed_origins {
+        tracing::info!("CORS configured with allowed origins: {:?}", allowed_origins);
+
+        use tower_http::cors::AllowOrigin;
+
+        let origins: Vec<_> = allowed_origins
+            .iter()
+            .filter_map(|origin| origin.parse::<axum::http::HeaderValue>().ok())
+            .collect();
+
+        CorsLayer::new()
+            .allow_origin(AllowOrigin::list(origins))
+            .allow_methods([
+                axum::http::Method::GET,
+                axum::http::Method::POST,
+                axum::http::Method::PUT,
+                axum::http::Method::PATCH,
+                axum::http::Method::DELETE,
+                axum::http::Method::OPTIONS,
+            ])
+            .allow_headers(tower_http::cors::Any)
+            .allow_credentials(true)
+    } else {
+        tracing::warn!("CORS not configured - using permissive mode (allows all origins)");
+        CorsLayer::permissive()
+    };
+
     // Configura las rutas de Axum
     let app = Router::new()
         // Rutas del gateway
@@ -123,20 +151,12 @@ async fn main() -> Result<()> {
         .fallback(proxy_handler)
         .with_state(proxy_state)
         // Middlewares
-        .layer(CorsLayer::permissive())
+        .layer(cors_layer)
         .layer(TraceLayer::new_for_http());
 
     // Inicia el servidor
     let addr = format!("0.0.0.0:{}", config.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-
-    tracing::info!("VK Gateway listening on {}", addr);
-    tracing::info!("Gateway endpoints:");
-    tracing::info!("  - GET  /health                        - Gateway health check");
-    tracing::info!("  - GET  /stats                         - Gateway statistics");
-    tracing::info!("  - POST /api/v1/files/delete-expired   - Delete expired files");
-    tracing::info!("  - *    /backend/:id/*                 - Proxy to specific backend");
-    tracing::info!("  - *    /*                             - Proxy to load-balanced backend");
 
     axum::serve(listener, app).await?;
 
