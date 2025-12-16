@@ -103,7 +103,10 @@ async fn main() -> Result<()> {
 
     // Configura CORS basado en variables de entorno
     let cors_layer = if let Some(allowed_origins) = &config.cors_allowed_origins {
-        tracing::info!("CORS configured with allowed origins: {:?}", allowed_origins);
+        tracing::info!(
+            "CORS configured with allowed origins: {:?}",
+            allowed_origins
+        );
 
         use tower_http::cors::AllowOrigin;
 
@@ -126,6 +129,8 @@ async fn main() -> Result<()> {
                 axum::http::header::AUTHORIZATION,
                 axum::http::header::CONTENT_TYPE,
                 axum::http::header::ACCEPT,
+                // Custom header X-VK-Secret
+                axum::http::header::HeaderName::from_static("x-vk-secret"),
             ])
             .allow_credentials(true)
     } else {
