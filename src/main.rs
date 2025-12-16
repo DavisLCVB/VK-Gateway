@@ -104,15 +104,15 @@ async fn main() -> Result<()> {
     // Configura las rutas de Axum
     let app = Router::new()
         // Rutas del gateway
-        .route("/health", get(gateway_health))
-        .route("/stats", get(gateway_stats))
+        .route("/api/v1/health", get(gateway_health))
+        .route("/api/v1/stats", get(gateway_stats))
         .route(
             "/api/v1/files/delete-expired",
             axum::routing::delete(delete_expired_files),
         )
         // Ruta para acceder a un backend específico por ID
         .route(
-            "/backend/:server_id/*path",
+            "/api/v1/backend/:server_id/*path",
             get(proxy_to_specific_backend)
                 .post(proxy_to_specific_backend)
                 .put(proxy_to_specific_backend)
