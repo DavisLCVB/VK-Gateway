@@ -122,7 +122,11 @@ async fn main() -> Result<()> {
                 axum::http::Method::DELETE,
                 axum::http::Method::OPTIONS,
             ])
-            .allow_headers(tower_http::cors::Any)
+            .allow_headers([
+                axum::http::header::AUTHORIZATION,
+                axum::http::header::CONTENT_TYPE,
+                axum::http::header::ACCEPT,
+            ])
             .allow_credentials(true)
     } else {
         tracing::warn!("CORS not configured - using permissive mode (allows all origins)");
