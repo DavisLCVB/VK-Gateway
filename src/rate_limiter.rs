@@ -77,26 +77,38 @@ pub async fn check_rate_limit(
     Ok(true)
 }
 
-/// Middleware to rate limit requests based on x-upload-token header
+/// Extract upload token from Authorization or X-Upload-Token headers
+fn extract_upload_token(req: &Request) -> Option<String> {
+    // Try Authorization: Bearer <token> first
+    if let Some(auth_header) = req.headers().get("authorization") {
+        if let Ok(auth_str) = auth_header.to_str() {
+            if let Some(token) = auth_str.strip_prefix("Bearer ") {
+                return Some(token.to_string());
+            }
+        }
+    }
+
+    // Fallback to X-Upload-Token header
+    if let Some(token_header) = req.headers().get("x-upload-token") {
+        if let Ok(token) = token_header.to_str() {
+            return Some(token.to_string());
+        }
+    }
+
+    None
+}
+
+/// Middleware to rate limit requests based on upload token
+/// Supports both Authorization: Bearer <token> and X-Upload-Token headers
 pub async fn rate_limit_middleware(
     mut redis_client: redis::aio::ConnectionManager,
     config: RateLimiterConfig,
     req: Request,
     next: Next,
 ) -> Response {
-    // Extract x-upload-token header
-    let token = match req.headers().get("x-upload-token") {
-        Some(token_header) => match token_header.to_str() {
-            Ok(token) => token,
-            Err(_) => {
-                tracing::warn!("Invalid x-upload-token header value");
-                return (
-                    StatusCode::BAD_REQUEST,
-                    "Invalid x-upload-token header",
-                )
-                    .into_response();
-            }
-        },
+    // Extract upload token from headers
+    let token = match extract_upload_token(&req) {
+        Some(t) => t,
         None => {
             // No token header, allow request to proceed
             return next.run(req).await;
@@ -104,7 +116,7 @@ pub async fn rate_limit_middleware(
     };
 
     // Check rate limit
-    match check_rate_limit(&mut redis_client, token, &config).await {
+    match check_rate_limit(&mut redis_client, &token, &config).await {
         Ok(true) => {
             // Rate limit OK, proceed
             next.run(req).await
